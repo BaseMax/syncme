@@ -1,4 +1,8 @@
 .syncme.yaml
+
+*.pyc
+
+__pycache__
 syncme.egg-info
 
 *.rar
