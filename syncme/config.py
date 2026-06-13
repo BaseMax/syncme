@@ -20,7 +20,7 @@ def load_config() -> Config:
         password=data["password"],
         remote_path=data["remote_path"].rstrip("/"),
         ignore=data.get("ignore", []),
-        workers=int(data.get("workers", 20)),
+        workers=int(data.get("workers", 30)),
     )
 
 
@@ -37,7 +37,7 @@ port: 22
 username: user
 password: pass
 remote_path: /var/www/project
-workers: 20
+workers: 30
 
 ignore:
   - .git
