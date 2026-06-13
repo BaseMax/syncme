@@ -1,4 +1,5 @@
-from typing import Optional
+from contextlib import contextmanager
+from typing import Generator, Optional
 
 import typer
 
@@ -14,6 +15,15 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+# Shared option definitions — declared once, referenced by each command.
+_DRY_RUN = typer.Option(False, "--dry-run", "-n", help="Preview transfers without executing them.")
+_WORKERS = typer.Option(1, "--workers", "-w", help="Parallel transfer threads (opens one connection per thread).")
+_RETRIES = typer.Option(3, "--retries", "-r", help="Retry count per file on failure.")
+_VERBOSE = typer.Option(False, "--verbose", help="Show skipped (up-to-date) files.")
+_QUIET = typer.Option(False, "--quiet", "-q", help="Suppress all output except errors.")
+
+
+# ------------------------------------------------------------------ helpers
 
 def _version_callback(value: bool) -> None:
     if value:
@@ -24,20 +34,57 @@ def _version_callback(value: bool) -> None:
 def create_client(config):
     if config.protocol == "ftp":
         return FTPClient(config)
-    elif config.protocol == "sftp":
+    if config.protocol == "sftp":
         return SFTPClient(config)
-    else:
-        raise ValueError(f"Unsupported protocol: {config.protocol!r}")
+    raise ValueError(f"Unsupported protocol: {config.protocol!r}")
 
+
+@contextmanager
+def _session(
+    verbose: bool,
+    quiet: bool,
+    dry_run: bool,
+    workers: int = 1,
+    retries: int = 3,
+) -> Generator[SyncEngine, None, None]:
+    """Set up logging, load config, open connection, yield engine; clean up on exit."""
+    set_verbose(verbose)
+    set_quiet(quiet)
+
+    try:
+        config = load_config()
+    except FileNotFoundError as e:
+        log_error(str(e))
+        raise typer.Exit(1)
+
+    if dry_run:
+        log("[yellow]Dry run — no files will be transferred.[/yellow]")
+
+    client = create_client(config)
+    engine = SyncEngine(
+        client, config,
+        client_factory=lambda: create_client(config),
+        workers=workers,
+        retries=retries,
+    )
+    try:
+        yield engine
+    except typer.Exit:
+        raise
+    except Exception as e:
+        log_error(str(e))
+        raise typer.Exit(1)
+    finally:
+        client.close()
+
+
+# ----------------------------------------------------------------- commands
 
 @app.callback()
 def _main(
     version: Optional[bool] = typer.Option(
-        None,
-        "--version",
-        "-V",
-        callback=_version_callback,
-        is_eager=True,
+        None, "--version", "-V",
+        callback=_version_callback, is_eager=True,
         help="Show version and exit.",
     ),
 ) -> None:
@@ -52,122 +99,53 @@ def init() -> None:
 
 @app.command()
 def push(
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be uploaded without transferring."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Parallel upload threads (uses multiple connections)."),
-    retries: int = typer.Option(3, "--retries", "-r", help="Retry count per file on failure."),
-    verbose: bool = typer.Option(False, "--verbose", help="Show skipped files."),
-    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress all output except errors."),
+    dry_run: bool = _DRY_RUN,
+    workers: int = _WORKERS,
+    retries: int = _RETRIES,
+    verbose: bool = _VERBOSE,
+    quiet: bool = _QUIET,
 ) -> None:
     """Upload all local files to the remote server."""
-    set_verbose(verbose)
-    set_quiet(quiet)
-
-    try:
-        config = load_config()
-    except FileNotFoundError as e:
-        log_error(str(e))
-        raise typer.Exit(1)
-
-    client = create_client(config)
-    engine = SyncEngine(
-        client,
-        config,
-        client_factory=lambda: create_client(config),
-        workers=workers,
-        retries=retries,
-    )
-
-    try:
-        if dry_run:
-            log("[yellow]Dry run — no files will be transferred.[/yellow]")
+    with _session(verbose, quiet, dry_run, workers, retries) as engine:
         stats = engine.push(dry_run=dry_run)
         verb = "Would upload" if dry_run else "Uploaded"
         log_success(f"\n{verb} {stats['uploaded']} file(s).  Failed: {stats['failed']}.")
-    except Exception as e:
-        log_error(f"Push failed: {e}")
-        raise typer.Exit(1)
-    finally:
-        client.close()
 
 
 @app.command()
 def pull(
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be downloaded without transferring."),
-    retries: int = typer.Option(3, "--retries", "-r", help="Retry count per file on failure."),
-    verbose: bool = typer.Option(False, "--verbose", help="Show skipped files."),
-    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress all output except errors."),
+    dry_run: bool = _DRY_RUN,
+    retries: int = _RETRIES,
+    verbose: bool = _VERBOSE,
+    quiet: bool = _QUIET,
 ) -> None:
     """Download all remote files to the local directory."""
-    set_verbose(verbose)
-    set_quiet(quiet)
-
-    try:
-        config = load_config()
-    except FileNotFoundError as e:
-        log_error(str(e))
-        raise typer.Exit(1)
-
-    client = create_client(config)
-    engine = SyncEngine(client, config, retries=retries)
-
-    try:
-        if dry_run:
-            log("[yellow]Dry run — no files will be transferred.[/yellow]")
+    with _session(verbose, quiet, dry_run, retries=retries) as engine:
         stats = engine.pull(dry_run=dry_run)
         verb = "Would download" if dry_run else "Downloaded"
         log_success(
             f"\n{verb} {stats['downloaded']} file(s).  "
             f"Skipped: {stats['skipped']}.  Failed: {stats['failed']}."
         )
-    except Exception as e:
-        log_error(f"Pull failed: {e}")
-        raise typer.Exit(1)
-    finally:
-        client.close()
 
 
 @app.command()
 def auto(
     force: bool = typer.Option(False, "--force", "-f", help="Upload all files, ignoring timestamps."),
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be synced without transferring."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Parallel upload threads (uses multiple connections)."),
-    retries: int = typer.Option(3, "--retries", "-r", help="Retry count per file on failure."),
-    verbose: bool = typer.Option(False, "--verbose", help="Show skipped files."),
-    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress all output except errors."),
+    dry_run: bool = _DRY_RUN,
+    workers: int = _WORKERS,
+    retries: int = _RETRIES,
+    verbose: bool = _VERBOSE,
+    quiet: bool = _QUIET,
 ) -> None:
     """Smart sync: upload only new or modified local files."""
-    set_verbose(verbose)
-    set_quiet(quiet)
-
-    try:
-        config = load_config()
-    except FileNotFoundError as e:
-        log_error(str(e))
-        raise typer.Exit(1)
-
-    client = create_client(config)
-    engine = SyncEngine(
-        client,
-        config,
-        client_factory=lambda: create_client(config),
-        workers=workers,
-        retries=retries,
-    )
-
-    try:
-        if dry_run:
-            log("[yellow]Dry run — no files will be transferred.[/yellow]")
+    with _session(verbose, quiet, dry_run, workers, retries) as engine:
         stats = engine.auto(force=force, dry_run=dry_run)
         verb = "Would upload" if dry_run else "Uploaded"
         log_success(
             f"\n{verb} {stats['uploaded']} file(s).  "
             f"Skipped: {stats['skipped']}.  Failed: {stats['failed']}."
         )
-    except Exception as e:
-        log_error(f"Auto sync failed: {e}")
-        raise typer.Exit(1)
-    finally:
-        client.close()
 
 
 if __name__ == "__main__":
