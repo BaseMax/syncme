@@ -1,4 +1,4 @@
-protocol: sftp # or ftp
+protocol: sftp   # or ftp
 
 host: 192.168.1.1
 port: 22
@@ -7,11 +7,14 @@ password: mypass
 
 remote_path: /var/www/project
 
-workers: 15
+workers: 15     # parallel connections (use 5-10 for shared hosting)
+retries: 3      # per-file retry count on transient errors
 
 ignore:
-  - vendor
-  - node_modules
   - .git
   - .env
+  - vendor
+  - node_modules
+  - ".DS_Store"
   - "*.log"
+  - "*.cache"

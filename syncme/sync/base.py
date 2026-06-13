@@ -50,8 +50,21 @@ class BaseClient(ABC):
         """Return True if *path* exists on the server and is a directory."""
 
     @abstractmethod
-    def list_files(self, remote_path: str) -> List[RemoteFile]:
-        pass
+    def list_dir_flat(self, remote_dir: str, base: str) -> List[RemoteFile]:
+        """List files in *remote_dir* without recursing into sub-directories.
+
+        Returned RemoteFile.path values are relative to *base*.  Only files
+        are returned — sub-directories are silently skipped.
+        """
+
+    @abstractmethod
+    def list_files(self, remote_path: str, ignore_spec=None) -> List[RemoteFile]:
+        """Recursively list files under *remote_path*, skipping ignored directories.
+
+        When *ignore_spec* is provided (a pathspec.PathSpec), any directory whose
+        relative path matches will be skipped entirely — avoiding expensive traversal
+        of vendor/, node_modules/, etc.
+        """
 
     @abstractmethod
     def upload(self, local: Path, remote: str) -> None:

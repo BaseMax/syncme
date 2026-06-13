@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List
 from .base import BaseClient
 from ..models import RemoteFile
+from ..utils.ignore import is_dir_ignored
 
 
 def _make_transport(config) -> paramiko.Transport:
@@ -54,7 +55,25 @@ class SFTPClient(BaseClient):
 
     # ----------------------------------------------------------------- listing
 
-    def list_files(self, remote_path: str) -> List[RemoteFile]:
+    def list_dir_flat(self, remote_dir: str, base: str) -> List[RemoteFile]:
+        """List files in remote_dir (one level, no recursion), paths relative to base."""
+        out: List[RemoteFile] = []
+        try:
+            for attr in self.sftp.listdir_attr(remote_dir):
+                if stat_mod.S_ISDIR(attr.st_mode or 0):
+                    continue
+                full = f"{remote_dir.rstrip('/')}/{attr.filename}"
+                rel = full[len(base):].lstrip("/")
+                out.append(RemoteFile(
+                    path=rel,
+                    mtime=float(attr.st_mtime or 0),
+                    size=attr.st_size or 0,
+                ))
+        except Exception:
+            pass
+        return out
+
+    def list_files(self, remote_path: str, ignore_spec=None) -> List[RemoteFile]:
         out: List[RemoteFile] = []
 
         def walk(base: str, current: str) -> None:
@@ -63,6 +82,8 @@ class SFTPClient(BaseClient):
                     full = f"{current.rstrip('/')}/{attr.filename}"
                     rel = full[len(base):].lstrip("/")
                     if stat_mod.S_ISDIR(attr.st_mode or 0):
+                        if ignore_spec and is_dir_ignored(ignore_spec, rel):
+                            continue
                         walk(base, full)
                     else:
                         out.append(RemoteFile(

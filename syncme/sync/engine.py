@@ -6,14 +6,13 @@ from queue import Queue
 from typing import Dict, FrozenSet, List, Set, Tuple
 
 from ..models import LocalFile, RemoteFile
-from ..utils.ignore import build_ignore, is_ignored
+from ..utils.ignore import build_ignore, is_ignored, is_dir_ignored
 from ..utils.logger import (
     log_info, log_verbose, log_warning, log_error,
     log_file_ok, log_file_fail, log_file_skip, log_file_retry, log_checking,
     fmt_size, fmt_dt,
 )
 
-# Set by KeyboardInterrupt; workers check this before starting each task.
 _shutdown = threading.Event()
 
 
@@ -45,9 +44,6 @@ class _Pool:
         self._clients: list = []
         self._seed_client = seed_client
 
-        # The seed client (engine's main connection) joins the pool so that
-        # total connections = workers instead of workers + 1, keeping within
-        # the server's per-IP connection limit.
         if seed_client is not None:
             seed_client._dir_cache.update(known_dirs)
             self._q.put(seed_client)
@@ -89,7 +85,7 @@ class _Pool:
     def close_all(self) -> None:
         for c in self._clients:
             if c is self._seed_client:
-                continue  # owned by _session; don't double-close
+                continue
             try:
                 c.close()
             except Exception:
@@ -103,14 +99,8 @@ class SyncEngine:
         self.workers = max(1, workers)
         self.retries = max(1, retries)
         self.ignore_spec = build_ignore(config.ignore)
-        # Pre-populate the dir cache with every component of remote_path so
-        # makedirs never tries to MKD them.  On chrooted FTP accounts (cPanel,
-        # Plesk) the session root / maps to the account home, so attempting
-        # MKD /home/user/public_html would create a nested home/ inside the
-        # account root — duplicating the full path tree inside itself.
         self._seed_remote_base()
 
-    # ----------------------------------------------------------------- helpers
 
     def _remote(self, rel: str) -> str:
         """Build the absolute remote path for a local-relative path."""
@@ -124,50 +114,52 @@ class SyncEngine:
             current = f"/{part}" if not current else f"{current}/{part}"
             self.client._dir_cache.add(current)
 
-    # --------------------------------------------------------- remote path check
 
     def verify_connection(self) -> None:
         """Verify that remote_path exists on the server; raise RuntimeError if not."""
         path = self.config.remote_path
         if path == "/":
-            return  # root always exists
+            return
         if not self.client.remote_is_dir(path):
             raise RuntimeError(
                 f"Remote path not found: {path}\n"
                 f"  → Create it on the server first, or update remote_path in .syncme.yaml"
             )
 
-    # ------------------------------------------------------------------- scan
 
     def _scan_local(self) -> List[LocalFile]:
         base = Path.cwd()
         result: List[LocalFile] = []
+        ignored_dirs = 0
 
         def walk(directory: Path) -> None:
+            nonlocal ignored_dirs
             try:
                 entries = sorted(directory.iterdir(), key=lambda p: p.name)
             except PermissionError:
                 return
             for entry in entries:
                 rel = entry.relative_to(base).as_posix()
-                if is_ignored(self.ignore_spec, rel):
-                    continue
                 if entry.is_dir():
+                    if is_dir_ignored(self.ignore_spec, rel):
+                        ignored_dirs += 1
+                        continue
                     walk(entry)
                 elif entry.is_file():
-                    st = entry.stat()
-                    result.append(LocalFile(
-                        path=entry,
-                        rel=rel,
-                        mtime=st.st_mtime,
-                        size=st.st_size,
-                    ))
+                    if not is_ignored(self.ignore_spec, rel):
+                        st = entry.stat()
+                        result.append(LocalFile(
+                            path=entry,
+                            rel=rel,
+                            mtime=st.st_mtime,
+                            size=st.st_size,
+                        ))
 
         walk(base)
-        log_info(f"Found {len(result)} local file(s).")
+        suffix = f"  ({ignored_dirs} ignored director{'y' if ignored_dirs == 1 else 'ies'})" if ignored_dirs else ""
+        log_info(f"Found {len(result)} local file(s).{suffix}")
         return result
 
-    # ----------------------------------------------------------------- upload
 
     def _upload_one(
         self,
@@ -220,13 +212,8 @@ class SyncEngine:
         if not dry_run:
             self._pre_create_dirs(ordered)
 
-        # Snapshot the dir cache (remote_path components + created dirs) and
-        # inject it into every pool client — makedirs calls become pure cache
-        # lookups during the parallel phase, zero extra round-trips.
         known_dirs: FrozenSet[str] = frozenset(self.client._dir_cache)
 
-        # Reuse main connection as the first pool slot.
-        # Total connections = self.workers (1 seed + workers-1 clones).
         n_clones = max(0, self.workers - 1)
         pool = _Pool(self.client.clone, n_clones, known_dirs, seed_client=self.client)
 
@@ -290,7 +277,6 @@ class SyncEngine:
                 stats["failed"] += 1
         return stats
 
-    # ---------------------------------------------------------------- commands
 
     def push(self, dry_run: bool = False) -> Dict[str, int]:
         t0 = time.monotonic()
@@ -301,14 +287,15 @@ class SyncEngine:
     def pull(self, dry_run: bool = False) -> Dict[str, int]:
         t0 = time.monotonic()
         stats = {"downloaded": 0, "failed": 0, "skipped": 0, "bytes": 0}
-        progress = _Progress(0)  # total unknown until listing done; updated below
 
-        remote_files = self.client.list_files(self.config.remote_path)
-        visible = [rf for rf in remote_files if not is_ignored(self.ignore_spec, rf.path)]
-        skipped = len(remote_files) - len(visible)
-        progress = _Progress(len(visible))
+        log_info("Listing remote files...")
+        # Pass ignore_spec so the recursive walk skips vendor/, node_modules/, etc.
+        # at the directory level instead of traversing them and filtering after.
+        remote_files = self.client.list_files(self.config.remote_path, self.ignore_spec)
+        log_verbose(f"Found {len(remote_files)} remote file(s).")
 
-        for rf in visible:
+        progress = _Progress(len(remote_files))
+        for rf in remote_files:
             try:
                 if not dry_run:
                     self.client.download(self._remote(rf.path), Path.cwd() / rf.path)
@@ -321,19 +308,71 @@ class SyncEngine:
                 log_file_fail(rf.path, str(e), tag)
                 stats["failed"] += 1
 
-        stats["skipped"] = skipped
         stats["elapsed"] = time.monotonic() - t0
         return stats
+
+    def _remote_snapshot(self, local_files: List[LocalFile]) -> Dict[str, RemoteFile]:
+        """
+        Build a remote file map by listing ONLY the remote directories that
+        correspond to local project directories.
+
+        This avoids the infinite-listing problem that occurs when remote_path='/'
+        and the FTP root contains system directories (mail, logs, etc.) that are
+        unrelated to the project.  For a typical project with 500 files in 50
+        directories, this issues 50 targeted MLSD/LIST calls instead of one
+        recursive walk over the entire account.
+        """
+        base = self.config.remote_path.rstrip("/")
+
+        # Collect unique remote directories that contain local files
+        remote_dirs: Set[str] = set()
+        for f in local_files:
+            parent = self._remote(f.rel).rsplit("/", 1)[0] or "/"
+            remote_dirs.add(parent)
+
+        if not remote_dirs:
+            return {}
+
+        dirs = sorted(remote_dirs)
+        n = len(dirs)
+        log_info(f"Checking {n} remote director{'y' if n == 1 else 'ies'}...")
+
+        # Parallel directory listing — cap pool to avoid unnecessary connections
+        n_workers = min(self.workers, n)
+        n_clones = max(0, n_workers - 1)
+        pool = _Pool(self.client.clone, n_clones, frozenset(), seed_client=self.client)
+
+        snapshot: Dict[str, RemoteFile] = {}
+        lock = threading.Lock()
+
+        def list_dir(d: str) -> None:
+            client = pool.acquire()
+            try:
+                files = client.list_dir_flat(d, base)
+                with lock:
+                    for rf in files:
+                        snapshot[rf.path] = rf
+            except Exception:
+                pass
+            finally:
+                pool.release(client)
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(pool._clients)) as ex:
+                futures = [ex.submit(list_dir, d) for d in dirs]
+                for _ in as_completed(futures):
+                    pass
+        finally:
+            pool.close_all()
+
+        return snapshot
 
     def auto(self, force: bool = False, dry_run: bool = False) -> Dict[str, int]:
         t0 = time.monotonic()
         local_files = self._scan_local()
 
-        log_info("Listing remote files...")
-        remote_map: Dict[str, RemoteFile] = {
-            f.path: f for f in self.client.list_files(self.config.remote_path)
-        }
-        log_verbose(f"Found {len(remote_map)} remote file(s).")
+        remote_map = self._remote_snapshot(local_files)
+        log_verbose(f"Found {len(remote_map)} remote file(s) in checked directories.")
 
         to_upload: List[LocalFile] = []
         skipped = 0
@@ -344,11 +383,8 @@ class SyncEngine:
             if force or not remote:
                 needs_upload = True
             elif remote.mtime > 0:
-                # Real timestamps available (SFTP or FTP with MLSD).
                 needs_upload = file.mtime > remote.mtime
             else:
-                # Only sizes available (FTP LIST fallback).
-                # Same size → assume unchanged; different → re-upload.
                 needs_upload = file.size != remote.size
 
             if needs_upload:

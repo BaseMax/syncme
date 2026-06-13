@@ -13,6 +13,7 @@ class Config:
     remote_path: str
     ignore: List[str]
     workers: int = 20
+    retries: int = 3
 
 
 @dataclass

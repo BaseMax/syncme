@@ -21,7 +21,7 @@ app = typer.Typer(
 # Shared option definitions. workers=None means "read from config" (default 20).
 _DRY_RUN = typer.Option(False,  "--dry-run", "-n", help="Preview transfers without executing them.")
 _WORKERS  = typer.Option(None,  "--workers", "-w", help="Parallel connections. Default: workers field in .syncme.yaml.")
-_RETRIES  = typer.Option(3,     "--retries", "-r", help="Retry count per file on failure.")
+_RETRIES  = typer.Option(None,  "--retries", "-r", help="Retry count per file on failure. Default: retries field in .syncme.yaml.")
 _VERBOSE  = typer.Option(False, "--verbose",       help="Show skipped files and comparison details.")
 _QUIET    = typer.Option(False, "--quiet",   "-q", help="Suppress all output except errors.")
 
@@ -73,7 +73,7 @@ def _session(
     quiet: bool,
     dry_run: bool,
     workers: Optional[int],
-    retries: int,
+    retries: Optional[int],
 ) -> Generator[SyncEngine, None, None]:
     """Load config, verify remote path, yield a ready engine, close on exit."""
     set_verbose(verbose)
@@ -94,8 +94,9 @@ def _session(
     )
 
     effective_workers = workers if workers is not None else config.workers
+    effective_retries = retries if retries is not None else config.retries
     client = create_client(config)
-    engine = SyncEngine(client, config, workers=effective_workers, retries=retries)
+    engine = SyncEngine(client, config, workers=effective_workers, retries=effective_retries)
 
     try:
         engine.verify_connection()
@@ -135,7 +136,7 @@ def init() -> None:
 def push(
     dry_run: bool = _DRY_RUN,
     workers: Optional[int] = _WORKERS,
-    retries: int = _RETRIES,
+    retries: Optional[int] = _RETRIES,
     verbose: bool = _VERBOSE,
     quiet: bool = _QUIET,
 ) -> None:
@@ -148,7 +149,7 @@ def push(
 @app.command()
 def pull(
     dry_run: bool = _DRY_RUN,
-    retries: int = _RETRIES,
+    retries: Optional[int] = _RETRIES,
     verbose: bool = _VERBOSE,
     quiet: bool = _QUIET,
 ) -> None:
@@ -163,7 +164,7 @@ def auto(
     force: bool = typer.Option(False, "--force", "-f", help="Upload all files, ignoring timestamps."),
     dry_run: bool = _DRY_RUN,
     workers: Optional[int] = _WORKERS,
-    retries: int = _RETRIES,
+    retries: Optional[int] = _RETRIES,
     verbose: bool = _VERBOSE,
     quiet: bool = _QUIET,
 ) -> None:

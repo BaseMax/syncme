@@ -21,6 +21,7 @@ def load_config() -> Config:
         remote_path=data["remote_path"].rstrip("/") or "/",
         ignore=data.get("ignore", []),
         workers=int(data.get("workers", 20)),
+        retries=int(data.get("retries", 3)),
     )
 
 
@@ -31,18 +32,22 @@ def init_config() -> None:
         return
 
     path.write_text("""\
-protocol: sftp
+protocol: sftp   # or ftp
 host: 127.0.0.1
 port: 22
 username: user
 password: pass
 remote_path: /var/www/project
-workers: 20
+
+workers: 20   # parallel connections
+retries: 3    # per-file retry count on failure
 
 ignore:
   - .git
+  - .env
+  - vendor
   - node_modules
   - "*.log"
-  - .env
+  - ".DS_Store"
 """)
     print(f"Created {CONFIG_FILE}")

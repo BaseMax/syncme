@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
 from ftplib import FTP, error_perm
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from .base import BaseClient
 from ..models import RemoteFile
+from ..utils.ignore import is_dir_ignored
 
 # 256 KB chunks — much faster than the 8 KB ftplib default on high-latency links.
 _BLOCK_SIZE = 256 * 1024
@@ -98,19 +99,70 @@ class FTPClient(BaseClient):
 
     # ----------------------------------------------------------------- listing
 
-    def list_files(self, remote_path: str) -> List[RemoteFile]:
+    def list_dir_flat(self, remote_dir: str, base: str) -> List[RemoteFile]:
+        """List files in remote_dir (one level, no recursion), paths relative to base."""
+        self._ensure_connected()
+        if self._mlsd_supported:
+            try:
+                return self._flat_mlsd(remote_dir, base)
+            except Exception:
+                self._mlsd_supported = False
+        return self._flat_list(remote_dir, base)
+
+    def _flat_mlsd(self, remote_dir: str, base: str) -> List[RemoteFile]:
+        out: List[RemoteFile] = []
+        entries = list(self.ftp.mlsd(remote_dir, facts=["type", "size", "modify"]))
+        for name, facts in entries:
+            if not name or name in (".", ".."):
+                continue
+            if facts.get("type", "file") in ("dir", "cdir", "pdir"):
+                continue
+            full = _join(remote_dir, name)
+            rel = full[len(base):].lstrip("/")
+            out.append(RemoteFile(
+                path=rel,
+                mtime=_parse_mlsd_time(facts.get("modify", "")),
+                size=int(facts.get("size", 0)),
+            ))
+        return out
+
+    def _flat_list(self, remote_dir: str, base: str) -> List[RemoteFile]:
+        entries: list = []
+
+        def parse(line: str) -> None:
+            parts = line.split(None, 8)
+            if len(parts) >= 9 and not parts[0].startswith("d"):
+                entries.append((parts[8].strip(), int(parts[4]) if parts[4].isdigit() else 0))
+
+        try:
+            self.ftp.retrlines(f"LIST {remote_dir}", parse)
+        except Exception:
+            return []
+
+        out: List[RemoteFile] = []
+        for name, size in entries:
+            if name in (".", ".."):
+                continue
+            full = _join(remote_dir, name)
+            rel = full[len(base):].lstrip("/")
+            out.append(RemoteFile(path=rel, mtime=0.0, size=size))
+        return out
+
+    def list_files(self, remote_path: str, ignore_spec=None) -> List[RemoteFile]:
         files: List[RemoteFile] = []
         if self._mlsd_supported:
             try:
-                self._collect_mlsd(remote_path, remote_path, files)
+                self._collect_mlsd(remote_path, remote_path, files, ignore_spec)
                 return files
             except Exception:
                 self._mlsd_supported = False
                 files = []
-        self._collect_list(remote_path, remote_path, files)
+        self._collect_list(remote_path, remote_path, files, ignore_spec)
         return files
 
-    def _collect_mlsd(self, base: str, current: str, out: List[RemoteFile]) -> None:
+    def _collect_mlsd(
+        self, base: str, current: str, out: List[RemoteFile], ignore_spec=None
+    ) -> None:
         """Recursive listing via MLSD (RFC 3659) — provides real mtimes."""
         entries = list(self.ftp.mlsd(current, facts=["type", "size", "modify"]))
         for name, facts in entries:
@@ -120,7 +172,9 @@ class FTPClient(BaseClient):
             full = _join(current, name)
             rel = full[len(base):].lstrip("/")
             if entry_type == "dir":
-                self._collect_mlsd(base, full, out)
+                if ignore_spec and is_dir_ignored(ignore_spec, rel):
+                    continue
+                self._collect_mlsd(base, full, out, ignore_spec)
             elif entry_type not in ("cdir", "pdir"):
                 out.append(RemoteFile(
                     path=rel,
@@ -128,7 +182,9 @@ class FTPClient(BaseClient):
                     size=int(facts.get("size", 0)),
                 ))
 
-    def _collect_list(self, base: str, current: str, out: List[RemoteFile]) -> None:
+    def _collect_list(
+        self, base: str, current: str, out: List[RemoteFile], ignore_spec=None
+    ) -> None:
         """Recursive listing via LIST — fallback when MLSD unavailable (mtime=0)."""
         entries: list = []
 
@@ -152,7 +208,9 @@ class FTPClient(BaseClient):
             full = _join(current, name)
             rel = full[len(base):].lstrip("/")
             if is_dir:
-                self._collect_list(base, full, out)
+                if ignore_spec and is_dir_ignored(ignore_spec, rel):
+                    continue
+                self._collect_list(base, full, out, ignore_spec)
             else:
                 out.append(RemoteFile(path=rel, mtime=0.0, size=size))
 
