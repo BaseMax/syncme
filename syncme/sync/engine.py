@@ -54,14 +54,13 @@ class _Pool:
 
 
 class SyncEngine:
-    def __init__(self, client, config, workers: int = 25, retries: int = 3) -> None:
+    def __init__(self, client, config, workers: int = 20, retries: int = 3) -> None:
         self.client = client
         self.config = config
         self.workers = max(1, workers)
         self.retries = max(1, retries)
         self.ignore_spec = build_ignore(config.ignore)
 
-    # ------------------------------------------------------------------- scan
 
     def _scan_local(self) -> List[LocalFile]:
         base = Path.cwd()
@@ -88,7 +87,6 @@ class SyncEngine:
         walk(base)
         return result
 
-    # ---------------------------------------------------------------- dirs
 
     def _pre_create_dirs(self, files: List[LocalFile]) -> None:
         """
@@ -105,7 +103,6 @@ class SyncEngine:
                 seen.add(parent)
                 self.client.makedirs(parent)
 
-    # --------------------------------------------------------------- transfer
 
     def _upload_one(self, file: LocalFile, client, dry_run: bool) -> None:
         log_action("Uploading", file.rel)
@@ -135,7 +132,6 @@ class SyncEngine:
                 else:
                     raise
 
-    # ---------------------------------------------------------- upload batch
 
     def _upload_batch(self, files: List[LocalFile], dry_run: bool) -> Dict[str, int]:
         if not files:
@@ -190,7 +186,6 @@ class SyncEngine:
 
         return {"uploaded": sum(results), "failed": results.count(False)}
 
-    # ---------------------------------------------------------------- commands
 
     def push(self, dry_run: bool = False) -> Dict[str, int]:
         return self._upload_batch(self._scan_local(), dry_run)

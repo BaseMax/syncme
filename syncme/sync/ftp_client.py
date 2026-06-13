@@ -13,7 +13,7 @@ class FTPClient(BaseClient):
         super().__init__()
         self._config = config
         self.ftp = FTP()
-        self.ftp.connect(config.host, config.port, timeout=25)
+        self.ftp.connect(config.host, config.port, timeout=20)
         self.ftp.login(config.username, config.password)
         self.ftp.set_pasv(True)
 
