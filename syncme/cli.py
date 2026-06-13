@@ -1,4 +1,4 @@
-﻿from contextlib import contextmanager
+from contextlib import contextmanager
 from typing import Generator, Optional
 
 import typer
@@ -8,7 +8,10 @@ from .config import load_config, init_config
 from .sync.engine import SyncEngine
 from .sync.ftp_client import FTPClient
 from .sync.sftp_client import SFTPClient
-from .utils.logger import log, log_success, log_error, set_verbose, set_quiet
+from .utils.logger import (
+    log, log_info, log_success, log_warning, log_error,
+    set_verbose, set_quiet, fmt_size,
+)
 
 app = typer.Typer(
     help="Sync local files to a remote server via FTP or SFTP.",
@@ -17,9 +20,9 @@ app = typer.Typer(
 
 # Shared option definitions. workers=None means "read from config" (default 20).
 _DRY_RUN = typer.Option(False,  "--dry-run", "-n", help="Preview transfers without executing them.")
-_WORKERS  = typer.Option(None,  "--workers", "-w", help="Parallel connections. Default: workers field in .syncme.yaml (20).")
+_WORKERS  = typer.Option(None,  "--workers", "-w", help="Parallel connections. Default: workers field in .syncme.yaml.")
 _RETRIES  = typer.Option(3,     "--retries", "-r", help="Retry count per file on failure.")
-_VERBOSE  = typer.Option(False, "--verbose",       help="Show skipped (up-to-date) files.")
+_VERBOSE  = typer.Option(False, "--verbose",       help="Show skipped files and comparison details.")
 _QUIET    = typer.Option(False, "--quiet",   "-q", help="Suppress all output except errors.")
 
 
@@ -39,6 +42,31 @@ def create_client(config):
     raise ValueError(f"Unsupported protocol: {config.protocol!r}")
 
 
+def _fmt_summary(stats: dict, verb: str, dry_run: bool) -> str:
+    """Build the final summary line including bytes transferred and speed."""
+    _base = {"Uploaded": "upload", "Downloaded": "download"}
+    action = f"Would {_base.get(verb, verb.lower())}" if dry_run else verb
+    n = stats.get("uploaded", stats.get("downloaded", 0))
+    byt = stats.get("bytes", 0)
+    elapsed = stats.get("elapsed", 0.0)
+
+    parts = [f"{n} file(s)"]
+    if byt > 0:
+        parts.append(fmt_size(byt))
+    if elapsed > 0.1 and not dry_run:
+        parts.append(f"{elapsed:.1f}s")
+        if byt > 0 and elapsed > 0:
+            parts.append(f"{fmt_size(int(byt / elapsed))}/s")
+
+    failed = stats.get("failed", 0)
+    skipped = stats.get("skipped")
+    tail = f"  Failed: {failed}."
+    if skipped is not None:
+        tail = f"  Skipped: {skipped}.{tail}"
+
+    return f"\n{action} {'  '.join(parts)}.{tail}"
+
+
 @contextmanager
 def _session(
     verbose: bool,
@@ -47,7 +75,7 @@ def _session(
     workers: Optional[int],
     retries: int,
 ) -> Generator[SyncEngine, None, None]:
-    """Load config, open the primary connection, yield a ready engine, close on exit."""
+    """Load config, verify remote path, yield a ready engine, close on exit."""
     set_verbose(verbose)
     set_quiet(quiet)
 
@@ -58,17 +86,25 @@ def _session(
         raise typer.Exit(1)
 
     if dry_run:
-        log("[yellow]Dry run -- no files will be transferred.[/yellow]")
+        log("[yellow]Dry run — no files will be transferred.[/yellow]")
 
-    # CLI flag overrides config; config overrides the built-in default of 20.
+    log_info(
+        f"{config.protocol.upper()}  {config.host}:{config.port}"
+        f"  →  {config.remote_path}"
+    )
+
     effective_workers = workers if workers is not None else config.workers
-
     client = create_client(config)
     engine = SyncEngine(client, config, workers=effective_workers, retries=retries)
+
     try:
+        engine.verify_connection()
         yield engine
     except typer.Exit:
         raise
+    except KeyboardInterrupt:
+        log_warning("\nInterrupted.")
+        raise typer.Exit(0)
     except Exception as e:
         log_error(str(e))
         raise typer.Exit(1)
@@ -106,8 +142,7 @@ def push(
     """Upload all local files to the remote server."""
     with _session(verbose, quiet, dry_run, workers, retries) as engine:
         stats = engine.push(dry_run=dry_run)
-        verb = "Would upload" if dry_run else "Uploaded"
-        log_success(f"\n{verb} {stats['uploaded']} file(s).  Failed: {stats['failed']}.")
+        log_success(_fmt_summary(stats, "Uploaded", dry_run))
 
 
 @app.command()
@@ -120,11 +155,7 @@ def pull(
     """Download all remote files to the local directory."""
     with _session(verbose, quiet, dry_run, workers=None, retries=retries) as engine:
         stats = engine.pull(dry_run=dry_run)
-        verb = "Would download" if dry_run else "Downloaded"
-        log_success(
-            f"\n{verb} {stats['downloaded']} file(s).  "
-            f"Skipped: {stats['skipped']}.  Failed: {stats['failed']}."
-        )
+        log_success(_fmt_summary(stats, "Downloaded", dry_run))
 
 
 @app.command()
@@ -139,11 +170,7 @@ def auto(
     """Smart sync: upload only new or modified local files."""
     with _session(verbose, quiet, dry_run, workers, retries) as engine:
         stats = engine.auto(force=force, dry_run=dry_run)
-        verb = "Would upload" if dry_run else "Uploaded"
-        log_success(
-            f"\n{verb} {stats['uploaded']} file(s).  "
-            f"Skipped: {stats['skipped']}.  Failed: {stats['failed']}."
-        )
+        log_success(_fmt_summary(stats, "Uploaded", dry_run))
 
 
 if __name__ == "__main__":

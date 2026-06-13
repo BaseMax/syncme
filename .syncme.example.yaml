@@ -7,6 +7,8 @@ password: mypass
 
 remote_path: /var/www/project
 
+workers: 15
+
 ignore:
   - vendor
   - node_modules

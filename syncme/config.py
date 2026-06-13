@@ -18,7 +18,7 @@ def load_config() -> Config:
         port=int(data.get("port") or DEFAULT_PORTS[protocol]),
         username=data["username"],
         password=data["password"],
-        remote_path=data["remote_path"].rstrip("/"),
+        remote_path=data["remote_path"].rstrip("/") or "/",
         ignore=data.get("ignore", []),
         workers=int(data.get("workers", 20)),
     )

@@ -32,11 +32,11 @@ class BaseClient(ABC):
 
     @abstractmethod
     def clone(self) -> "BaseClient":
-        """Return a new client that shares expensive resources where possible.
+        """Return a new client sharing expensive resources where possible.
 
-        FTP: opens a fresh TCP connection.
-        SFTP: opens a new SFTP channel over the *same* SSH transport - no
-              repeated key exchange or authentication.
+        FTP:  opens a fresh TCP connection.
+        SFTP: opens a new SFTP channel over the same SSH transport — no
+              repeated handshake or authentication.
         """
 
     # ---------------------------------------------------------- abstract hooks
@@ -44,6 +44,10 @@ class BaseClient(ABC):
     @abstractmethod
     def _try_mkdir(self, path: str) -> None:
         """Create a single remote directory; silently ignore if it already exists."""
+
+    @abstractmethod
+    def remote_is_dir(self, path: str) -> bool:
+        """Return True if *path* exists on the server and is a directory."""
 
     @abstractmethod
     def list_files(self, remote_path: str) -> List[RemoteFile]:
