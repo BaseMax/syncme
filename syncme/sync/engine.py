@@ -1,7 +1,7 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from queue import Queue
-from typing import Callable, Dict, List, Optional
+from typing import Dict, FrozenSet, List, Set
 
 from ..models import LocalFile, RemoteFile
 from ..utils.ignore import build_ignore, is_ignored
@@ -9,15 +9,35 @@ from ..utils.logger import log_action, log_verbose, log_warning, log_error
 
 
 class _Pool:
-    """Fixed-size connection pool — one slot per worker thread."""
+    """
+    Fixed-size connection pool.
 
-    def __init__(self, factory: Callable, size: int) -> None:
+    All connections are opened in parallel (warm-up), so setup latency equals
+    one connection's time rather than N times that.  The pre-built dir-cache is
+    injected into every client so pool workers never issue a makedirs network
+    call — they hit the local set and move straight to the file transfer.
+    """
+
+    def __init__(self, clone_fn, size: int, known_dirs: FrozenSet[str] = frozenset()) -> None:
         self._q: Queue = Queue()
         self._clients: list = []
-        for _ in range(size):
-            c = factory()
-            self._q.put(c)
-            self._clients.append(c)
+
+        # Open all connections concurrently — critical for FTP where each
+        # connection needs a TCP handshake + login round-trip.
+        with ThreadPoolExecutor(max_workers=size) as ex:
+            futures = [ex.submit(clone_fn) for _ in range(size)]
+
+        for f in futures:
+            try:
+                c = f.result()
+                c._dir_cache.update(known_dirs)   # skip makedirs network calls
+                self._q.put(c)
+                self._clients.append(c)
+            except Exception as e:
+                log_error(f"  Pool: failed to open connection: {e}")
+
+        if not self._clients:
+            raise RuntimeError("Could not open any pool connections.")
 
     def acquire(self):
         return self._q.get()
@@ -34,17 +54,9 @@ class _Pool:
 
 
 class SyncEngine:
-    def __init__(
-        self,
-        client,
-        config,
-        client_factory: Optional[Callable] = None,
-        workers: int = 1,
-        retries: int = 3,
-    ) -> None:
+    def __init__(self, client, config, workers: int = 20, retries: int = 3) -> None:
         self.client = client
         self.config = config
-        self.client_factory = client_factory
         self.workers = max(1, workers)
         self.retries = max(1, retries)
         self.ignore_spec = build_ignore(config.ignore)
@@ -75,6 +87,23 @@ class SyncEngine:
 
         walk(base)
         return result
+
+    # ---------------------------------------------------------------- dirs
+
+    def _pre_create_dirs(self, files: List[LocalFile]) -> None:
+        """
+        Create every remote directory that will be needed, in a single serial
+        pass on the main connection, before the parallel flood starts.
+
+        Workers then inherit a pre-populated dir-cache and skip all makedirs
+        network calls entirely, going straight to the data transfer.
+        """
+        seen: Set[str] = set()
+        for file in files:
+            parent = f"{self.config.remote_path}/{file.rel}".rsplit("/", 1)[0]
+            if parent and parent not in seen:
+                seen.add(parent)
+                self.client.makedirs(parent)
 
     # --------------------------------------------------------------- transfer
 
@@ -109,10 +138,9 @@ class SyncEngine:
     # ---------------------------------------------------------- upload batch
 
     def _upload_batch(self, files: List[LocalFile], dry_run: bool) -> Dict[str, int]:
-        """Upload a list of files, using a thread pool when workers > 1."""
         if not files:
             return {"uploaded": 0, "failed": 0}
-        if self.workers > 1 and self.client_factory:
+        if self.workers > 1:
             return self._upload_parallel(files, dry_run)
         return self._upload_sequential(files, dry_run)
 
@@ -128,8 +156,18 @@ class SyncEngine:
         return stats
 
     def _upload_parallel(self, files: List[LocalFile], dry_run: bool) -> Dict[str, int]:
+        # Largest-first (LPT rule): maximises worker utilisation by ensuring the
+        # longest jobs start immediately, so short files fill in the tail gaps.
+        ordered = sorted(files, key=lambda f: f.size, reverse=True)
+
+        # Pre-create all remote directories once on the main connection,
+        # then snapshot the cache so pool workers inherit it instantly.
+        if not dry_run:
+            self._pre_create_dirs(ordered)
+        known_dirs: FrozenSet[str] = frozenset(self.client._dir_cache)
+
         results: List[bool] = []
-        pool = _Pool(self.client_factory, self.workers)  # type: ignore[arg-type]
+        pool = _Pool(self.client.clone, self.workers, known_dirs)
         try:
             def do(file: LocalFile) -> bool:
                 client = pool.acquire()
@@ -142,10 +180,14 @@ class SyncEngine:
                 finally:
                     pool.release(client)
 
-            with ThreadPoolExecutor(max_workers=self.workers) as ex:
-                results = list(ex.map(do, files))
+            # Use as_completed so a worker picks up the next file the instant
+            # it finishes — no batch boundaries, no idle time between waves.
+            with ThreadPoolExecutor(max_workers=len(pool._clients)) as ex:
+                future_map = {ex.submit(do, f): f for f in ordered}
+                results = [fut.result() for fut in as_completed(future_map)]
         finally:
             pool.close_all()
+
         return {"uploaded": sum(results), "failed": results.count(False)}
 
     # ---------------------------------------------------------------- commands

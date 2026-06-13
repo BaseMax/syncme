@@ -28,6 +28,17 @@ class BaseClient(ABC):
             self.makedirs(parent)
         return remote
 
+    # ------------------------------------------------------------- clone hook
+
+    @abstractmethod
+    def clone(self) -> "BaseClient":
+        """Return a new client that shares expensive resources where possible.
+
+        FTP: opens a fresh TCP connection.
+        SFTP: opens a new SFTP channel over the *same* SSH transport - no
+              repeated key exchange or authentication.
+        """
+
     # ---------------------------------------------------------- abstract hooks
 
     @abstractmethod

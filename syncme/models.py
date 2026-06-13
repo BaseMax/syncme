@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
@@ -12,6 +12,7 @@ class Config:
     password: str
     remote_path: str
     ignore: List[str]
+    workers: int = 20
 
 
 @dataclass

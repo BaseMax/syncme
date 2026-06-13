@@ -4,20 +4,34 @@ from typing import List
 from .base import BaseClient
 from ..models import RemoteFile
 
+# 256 KB chunks - much faster than the 8 KB ftplib default on high-latency links.
+_BLOCK_SIZE = 256 * 1024
+
 
 class FTPClient(BaseClient):
     def __init__(self, config) -> None:
         super().__init__()
+        self._config = config
         self.ftp = FTP()
         self.ftp.connect(config.host, config.port, timeout=30)
         self.ftp.login(config.username, config.password)
         self.ftp.set_pasv(True)
 
+    # ------------------------------------------------------------------ clone
+
+    def clone(self) -> "FTPClient":
+        """Open a brand-new FTP connection using the same credentials."""
+        return FTPClient(self._config)
+
+    # ----------------------------------------------------------- dir creation
+
     def _try_mkdir(self, path: str) -> None:
         try:
             self.ftp.mkd(path)
         except error_perm:
-            pass
+            pass  # directory already exists
+
+    # ----------------------------------------------------------------- listing
 
     def list_files(self, remote_path: str) -> List[RemoteFile]:
         files: List[RemoteFile] = []
@@ -51,15 +65,21 @@ class FTPClient(BaseClient):
             else:
                 out.append(RemoteFile(path=rel, mtime=0, size=size))
 
+    # ----------------------------------------------------------------- upload
+
     def upload(self, local: Path, remote: str) -> None:
         remote = self._pre_upload(remote)
         with open(local, "rb") as f:
-            self.ftp.storbinary(f"STOR {remote}", f)
+            self.ftp.storbinary(f"STOR {remote}", f, blocksize=_BLOCK_SIZE)
+
+    # --------------------------------------------------------------- download
 
     def download(self, remote: str, local: Path) -> None:
         local.parent.mkdir(parents=True, exist_ok=True)
         with open(local, "wb") as f:
-            self.ftp.retrbinary(f"RETR {remote}", f.write)
+            self.ftp.retrbinary(f"RETR {remote}", f.write, blocksize=_BLOCK_SIZE)
+
+    # ------------------------------------------------------------------- close
 
     def close(self) -> None:
         try:

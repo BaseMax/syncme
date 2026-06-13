@@ -1,8 +1,8 @@
-# syncme
+﻿# syncme
 
 A fast CLI tool to sync your local project files to a remote server over **FTP** or **SFTP**.
 
-Supports parallel transfers, smart diff-based syncing, dry-run previews, and automatic retries.
+Supports 20 parallel transfers by default, smart diff-based syncing, dry-run previews, and automatic retries.
 
 ## Installation
 
@@ -18,23 +18,24 @@ Requires Python 3.11+.
 # 1. Create a config file in your project root
 syncme init
 
-# 2. Edit .syncme.yaml with your server details (see Configuration below)
+# 2. Edit .syncme.yaml with your server details
 
-# 3. Upload everything
+# 3. Upload everything (20 parallel connections by default)
 syncme push
 ```
 
 ## Configuration
 
-`syncme init` creates a `.syncme.yaml` template in the current directory. Edit it:
+`syncme init` creates a `.syncme.yaml` template. Edit it:
 
 ```yaml
 protocol: sftp          # ftp  or  sftp
 host: example.com
-port: 22                # optional — defaults: ftp=21, sftp=22
+port: 22                # optional -- defaults: ftp=21, sftp=22
 username: user
 password: secret
 remote_path: /var/www/myproject
+workers: 20             # parallel connections (see Performance section)
 
 ignore:
   - .git
@@ -58,8 +59,8 @@ All transfer commands (`push`, `pull`, `auto`) accept:
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--dry-run` | `-n` | off | Preview what would transfer — no files moved |
-| `--workers N` | `-w N` | `1` | Parallel connections for faster transfers |
+| `--dry-run` | `-n` | off | Preview what would transfer -- no files moved |
+| `--workers N` | `-w N` | from config | Override `workers` from config for this run |
 | `--retries N` | `-r N` | `3` | Retry count per file on network failure |
 | `--verbose` | | off | Show skipped (up-to-date) files |
 | `--quiet` | `-q` | off | Suppress all output except errors |
@@ -72,53 +73,73 @@ All transfer commands (`push`, `pull`, `auto`) accept:
 # Preview what push would do
 syncme push --dry-run
 
-# Upload with 4 parallel connections
-syncme push --workers 4
+# Override workers just for this run
+syncme push --workers 40
 
-# Smart sync — only changed files, show skipped ones
-syncme auto --verbose
+# Smart sync -- only changed files
+syncme auto
 
-# Force full re-upload, no output
+# Force full re-upload, silent output
 syncme auto --force --quiet
 
-# Download remote files (dry run first)
+# Download remote files
 syncme pull --dry-run
 syncme pull
-
-# Check version
-syncme --version
 ```
 
-## How it works
+## Performance
 
-**`push`** — scans the local directory recursively (respecting `.gitignore`-style `ignore` patterns), then uploads every file to the matching path on the remote. Remote directories are created automatically.
+syncme is designed to max out your available bandwidth rather than wait for one file at a time.
 
-**`pull`** — lists the remote directory recursively, then downloads every file to the matching local path, creating subdirectories as needed.
+### What happens during a push with workers=20
 
-**`auto`** — combines both: compares local mtimes against remote mtimes and only uploads files that are newer locally. Use `--force` to skip the comparison and upload everything.
+1. **Directory pre-creation** -- before touching the thread pool, the engine makes one serial pass to create every remote directory that will be needed. Workers never stall on `makedirs`.
 
-**Parallel transfers** (`--workers N`) open N simultaneous connections. Each worker gets its own dedicated connection from a pool, so there is no lock contention and throughput scales linearly up to the server's connection limit.
+2. **Parallel pool warm-up** -- all 20 connections are opened *simultaneously* (not one after another), so setup cost equals one connection's time regardless of pool size.
 
-**Retries** — each file is retried up to N times on failure before being counted as an error. The final summary always shows how many files succeeded, were skipped, and failed.
+3. **SFTP: one SSH handshake for all workers** -- `clone()` opens a new SFTP *channel* over the shared SSH transport instead of a new SSH connection. Cost: ~1 ms per extra worker, versus ~300 ms per full reconnect. All 20 workers share one TCP connection and one authentication handshake.
+
+4. **FTP: separate connections opened in parallel** -- FTP cannot multiplex channels, so each worker gets its own TCP connection. They are all established at the same time in step 2.
+
+5. **LPT scheduling** -- files are sorted largest-first (Longest Processing Time rule) before being dispatched. Large files start immediately, and small files fill in the gaps at the end, keeping all workers busy until the last byte is sent.
+
+6. **Zero-cost makedirs during upload** -- the dir-cache built in step 1 is injected into every pool client. When a worker calls `upload()`, the parent-directory check is a local set lookup with no network round-trip.
+
+7. **as_completed dispatch** -- workers pick up the next file the instant they finish the previous one, with no batch boundaries or idle gaps.
+
+### Tuning `workers`
+
+| Scenario | Recommended `workers` |
+|---|---|
+| SFTP, fast server | 20--50 (channels are cheap) |
+| FTP, permissive server | 10--20 (check server connection limit) |
+| FTP, strict server | 5--10 |
+| Slow / metered link | 1--4 |
+
+If the server rejects connections, reduce `workers` in `.syncme.yaml`.
+
+### Transfer chunk size
+
+FTP transfers use 256 KB chunks (vs the 8 KB ftplib default), which reduces per-syscall overhead on high-latency links. SFTP uses paramiko defaults with the SSH window enlarged to 3 MB and mid-transfer rekeying suppressed.
 
 ## Project structure
 
 ```
 syncme/
-├── cli.py              # Typer commands + _session context manager
-├── config.py           # YAML config loading + init_config
-├── constants.py        # VERSION, CONFIG_FILE, DEFAULT_PORTS
-├── models.py           # Config, LocalFile, RemoteFile dataclasses
-├── sync/
-│   ├── base.py         # BaseClient ABC — makedirs, _pre_upload shared logic
-│   ├── ftp_client.py   # FTP implementation
-│   ├── sftp_client.py  # SFTP implementation (paramiko)
-│   └── engine.py       # SyncEngine — scan, upload/download, _Pool
-└── utils/
-    ├── ignore.py       # pathspec-based gitignore matching
-    └── logger.py       # rich-based coloured output, verbose/quiet globals
++-- cli.py              # Typer commands + _session context manager
++-- config.py           # YAML config loading + init_config
++-- constants.py        # VERSION, CONFIG_FILE, DEFAULT_PORTS
++-- models.py           # Config, LocalFile, RemoteFile dataclasses
++-- sync/
+|   +-- base.py         # BaseClient ABC -- makedirs, _pre_upload, clone()
+|   +-- ftp_client.py   # FTP -- new connection per clone(), 256 KB blocks
+|   +-- sftp_client.py  # SFTP -- shared transport, ~1 ms clone()
+|   +-- engine.py       # SyncEngine -- scan, _Pool, _pre_create_dirs, LPT
++-- utils/
+    +-- ignore.py       # pathspec gitignore matching
+    +-- logger.py       # rich coloured output, verbose/quiet globals
 ```
 
 ## License
 
-GPL-3.0 © 2026 Seyyed Ali Mohammadiyeh (MAX BASE)
+GPL-3.0 (c) 2026 Seyyed Ali Mohammadiyeh (MAX BASE)

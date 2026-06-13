@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+﻿from contextlib import contextmanager
 from typing import Generator, Optional
 
 import typer
@@ -15,12 +15,12 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
-# Shared option definitions — declared once, referenced by each command.
-_DRY_RUN = typer.Option(False, "--dry-run", "-n", help="Preview transfers without executing them.")
-_WORKERS = typer.Option(1, "--workers", "-w", help="Parallel transfer threads (opens one connection per thread).")
-_RETRIES = typer.Option(3, "--retries", "-r", help="Retry count per file on failure.")
-_VERBOSE = typer.Option(False, "--verbose", help="Show skipped (up-to-date) files.")
-_QUIET = typer.Option(False, "--quiet", "-q", help="Suppress all output except errors.")
+# Shared option definitions. workers=None means "read from config" (default 20).
+_DRY_RUN = typer.Option(False,  "--dry-run", "-n", help="Preview transfers without executing them.")
+_WORKERS  = typer.Option(None,  "--workers", "-w", help="Parallel connections. Default: workers field in .syncme.yaml (20).")
+_RETRIES  = typer.Option(3,     "--retries", "-r", help="Retry count per file on failure.")
+_VERBOSE  = typer.Option(False, "--verbose",       help="Show skipped (up-to-date) files.")
+_QUIET    = typer.Option(False, "--quiet",   "-q", help="Suppress all output except errors.")
 
 
 # ------------------------------------------------------------------ helpers
@@ -44,10 +44,10 @@ def _session(
     verbose: bool,
     quiet: bool,
     dry_run: bool,
-    workers: int = 1,
-    retries: int = 3,
+    workers: Optional[int],
+    retries: int,
 ) -> Generator[SyncEngine, None, None]:
-    """Set up logging, load config, open connection, yield engine; clean up on exit."""
+    """Load config, open the primary connection, yield a ready engine, close on exit."""
     set_verbose(verbose)
     set_quiet(quiet)
 
@@ -58,15 +58,13 @@ def _session(
         raise typer.Exit(1)
 
     if dry_run:
-        log("[yellow]Dry run — no files will be transferred.[/yellow]")
+        log("[yellow]Dry run -- no files will be transferred.[/yellow]")
+
+    # CLI flag overrides config; config overrides the built-in default of 20.
+    effective_workers = workers if workers is not None else config.workers
 
     client = create_client(config)
-    engine = SyncEngine(
-        client, config,
-        client_factory=lambda: create_client(config),
-        workers=workers,
-        retries=retries,
-    )
+    engine = SyncEngine(client, config, workers=effective_workers, retries=retries)
     try:
         yield engine
     except typer.Exit:
@@ -100,7 +98,7 @@ def init() -> None:
 @app.command()
 def push(
     dry_run: bool = _DRY_RUN,
-    workers: int = _WORKERS,
+    workers: Optional[int] = _WORKERS,
     retries: int = _RETRIES,
     verbose: bool = _VERBOSE,
     quiet: bool = _QUIET,
@@ -120,7 +118,7 @@ def pull(
     quiet: bool = _QUIET,
 ) -> None:
     """Download all remote files to the local directory."""
-    with _session(verbose, quiet, dry_run, retries=retries) as engine:
+    with _session(verbose, quiet, dry_run, workers=None, retries=retries) as engine:
         stats = engine.pull(dry_run=dry_run)
         verb = "Would download" if dry_run else "Downloaded"
         log_success(
@@ -133,7 +131,7 @@ def pull(
 def auto(
     force: bool = typer.Option(False, "--force", "-f", help="Upload all files, ignoring timestamps."),
     dry_run: bool = _DRY_RUN,
-    workers: int = _WORKERS,
+    workers: Optional[int] = _WORKERS,
     retries: int = _RETRIES,
     verbose: bool = _VERBOSE,
     quiet: bool = _QUIET,
