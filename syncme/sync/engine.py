@@ -54,7 +54,7 @@ class _Pool:
 
 
 class SyncEngine:
-    def __init__(self, client, config, workers: int = 30, retries: int = 3) -> None:
+    def __init__(self, client, config, workers: int = 25, retries: int = 3) -> None:
         self.client = client
         self.config = config
         self.workers = max(1, workers)
