@@ -1,0 +1,15 @@
+[project]
+name = "syncme"
+version = "0.2.0"
+requires-python = ">=3.11"
+
+dependencies = [
+    "typer",
+    "paramiko",
+    "pyyaml",
+    "pathspec",
+    "rich>=13.0",
+]
+
+[project.scripts]
+syncme = "syncme.cli:app"

@@ -1,0 +1,15 @@
+protocol: sftp # or ftp
+
+host: 192.168.1.1
+port: 22
+username: myuser
+password: mypass
+
+remote_path: /var/www/project
+
+ignore:
+  - vendor
+  - node_modules
+  - .git
+  - .env
+  - "*.log"

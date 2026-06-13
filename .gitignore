@@ -1,0 +1,8 @@
+.syncme.yaml
+syncme.egg-info
+
+*.rar
+*.zip
+*.tar
+*.gz
+*.tar.gz
